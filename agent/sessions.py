@@ -30,7 +30,46 @@ def _conn():
             tool_calls TEXT,
             created_at TEXT NOT NULL
         )""")
+    # Phase 7: FTS5 inverted index over the same table (external content —
+    # no row duplication). The trigger keeps it in sync with the diary:
+    # the append-only invariant is untouched, the index just follows it.
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            content, role, session_id,
+            content='messages', content_rowid='id'
+        )""")
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages
+        BEGIN
+            INSERT INTO messages_fts(rowid, content, role, session_id)
+            VALUES (new.id, new.content, new.role, new.session_id);
+        END""")
     return conn
+
+
+def rebuild_index():
+    """Index rows written BEFORE the FTS5 trigger existed (Phase 3 DBs)."""
+    with _conn() as conn:
+        n_msgs = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        n_fts = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+        if n_msgs > n_fts:
+            conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+
+
+def search(query: str, limit: int = 5) -> list:
+    """Full-text search over ALL past sessions, BM25-ranked. Query is split
+    into OR'd quoted terms (safe against FTS syntax errors). Returns
+    (session_id, role, snippet) tuples — snippets, not full rows, so results
+    obey the same attention budget as any tool output."""
+    terms = [f'"{t}"' for t in query.split() if t]
+    if not terms:
+        return []
+    sql = ("SELECT session_id, role, "
+           "snippet(messages_fts, 0, '>>', '<<', ' ... ', 15) "
+           "FROM messages_fts WHERE messages_fts MATCH ? "
+           "ORDER BY bm25(messages_fts) LIMIT ?")
+    with _conn() as conn:
+        return conn.execute(sql, (" OR ".join(terms), limit)).fetchall()
 
 
 def new_session(title: str = None, parent_id: str = None) -> str:

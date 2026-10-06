@@ -4,6 +4,7 @@
 # Include a `finish` tool: agent must declare done WITH evidence.
 from tools.files import read_file, write_file, run_command
 from tools.todo import handle_todo
+from tools.memory_search import handle_session_search
 from tools.sandbox import validate_path
 from tools.approval import is_dangerous, request_approval
 from agent.subagents import spawn_child, depth
@@ -87,6 +88,21 @@ SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "session_search",
+            "description": "Search ALL your past conversations (full-text, BM25-ranked). Use when you need something remembered from a previous session: a fix you applied, a decision made, a command that worked, a user preference mentioned. Returns short snippets with session ids.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keywords to search for, e.g. 'auth token fix'"},
+                    "limit": {"type": "integer", "description": "Max results (default 5, max 10)"}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish",
             "description": "Declare the task complete. MUST be called when done, with concrete evidence — never claim success without verification. Also call it when the task is impossible, explaining what blocked you.",
             "parameters": {
@@ -109,6 +125,7 @@ REGISTRY = {
     "write_file": write_file,
     "run_command": run_command,
     "todo": handle_todo,
+    "session_search": handle_session_search,
 }
 
 def dispatch(name: str, args: dict) -> str:

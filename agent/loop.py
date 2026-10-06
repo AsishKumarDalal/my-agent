@@ -12,9 +12,10 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from agent.llm import chat
 from agent.prompt import SYSTEM_PROMPT
 from agent.context import maybe_compress
+from agent.memory import load_memory
+from agent.resilience import chat_with_retries, RunAborted
 from agent import sessions
 from tools.registry import schemas, dispatch
 
@@ -22,10 +23,39 @@ MAX_TURNS = 25
 MAX_TOOL_OUTPUT = 2000
 
 
+def _make_renderer():
+    """Returns (render, state). `render` prints text deltas live; `state`
+    tracks whether anything was rendered so the loop can close the line.
+    Sub-agent output gets a prefix — children stream from their own threads
+    and would otherwise interleave illegibly with the parent's."""
+    state = {"started": False}
+
+    def render(token: str):
+        if not state["started"]:
+            try:
+                from agent.subagents import depth
+                who = "sub-agent" if depth() > 0 else "thinking"
+            except Exception:
+                who = "thinking"
+            print(f"\n💭 [{who}] ", end="", flush=True)
+            state["started"] = True
+        print(token, end="", flush=True)
+
+    return render, state
+
+
 def run(user_message: str, history: list = None, session_id: str = None,
         max_turns: int = MAX_TURNS, allow_delegate: bool = True):
     """Returns (final_answer, history_without_system_prompt)."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + (history or [])
+    # Phase 7: semantic memory injected into the system prompt tier — the
+    # "always true" knowledge. Safe to do on EVERY run(): messages are rebuilt
+    # fresh each call and history excludes the system prompt, so it never
+    # duplicates or compounds.
+    sys_content = SYSTEM_PROMPT
+    memory = load_memory()
+    if memory:
+        sys_content += "\n\n[PERSISTENT MEMORY — facts from past sessions]\n" + memory
+    messages = [{"role": "system", "content": sys_content}] + (history or [])
     messages.append({"role": "user", "content": user_message})
     if session_id:
         sessions.append(session_id, "user", user_message)
@@ -37,7 +67,24 @@ def run(user_message: str, history: list = None, session_id: str = None,
         # API call). Under budget it returns messages unchanged — a no-op.
         messages = maybe_compress(messages)
 
-        assistant_msg = chat(messages, schemas())
+        # Phase 8: stream tokens live. AGENT_STREAM=0 restores the old
+        # silent-until-done behavior. Internal calls (summaries, reflection)
+        # pass no callback, so they never print.
+        render, streamed = _make_renderer()
+        on_text = render if os.getenv("AGENT_STREAM", "1") == "1" else None
+
+        # Phase 6: the harness layer handles API failures below the model's
+        # awareness (backoff+jitter, emergency compression, circuit breaker).
+        # Nothing was appended yet, so retries can never double-persist.
+        try:
+            assistant_msg = chat_with_retries(messages, schemas(), on_text=on_text)
+        except RunAborted as e:
+            # honest stop — the session stays valid for /resume
+            return f"Run aborted: {e}", messages[1:]
+        finally:
+            if streamed["started"]:
+                print()   # close the streamed line before ACT/OBSERVE output
+
         messages.append(assistant_msg)  # RULE 1: assistant msg BEFORE tool results
         if session_id:
             # store tool_calls JSON too — /resume must be protocol-valid
