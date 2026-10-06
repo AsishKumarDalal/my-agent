@@ -136,173 +136,66 @@ The test: if a future phase (Telegram, subagents, FTS5) requires touching the lo
 
 ---
 
-## 4. Code
+## 4. Code — the key parts
 
-### `agent/context.py`
+**`agent/context.py`** — the three functions that matter:
 
 ```python
-# Token accounting + compression. maybe_compress() fires BEFORE each model
-# call, cuts ONLY at turn boundaries. Pure-ish: list in -> list out.
-import os
-try:
-    import tiktoken
-    _enc = tiktoken.get_encoding("cl100k_base")
-    def count_tokens(text: str) -> int:
-        return len(_enc.encode(text))
-except ImportError:
-    def count_tokens(text: str) -> int:
-        return max(1, len(text) // 4)   # heuristic fallback
-
 CONTEXT_BUDGET = int(os.getenv("AGENT_CONTEXT_BUDGET", "24000"))  # soft threshold
-KEEP_RECENT = int(os.getenv("AGENT_KEEP_RECENT", "6"))   # turns kept verbatim
-COMPRESS_TO = 0.4                                        # compress down to 40%
+KEEP_RECENT    = int(os.getenv("AGENT_KEEP_RECENT", "6"))         # turns verbatim
+COMPRESS_TO    = 0.4                                              # target: 40%
 
-def context_size(messages: list) -> int:
-    return sum(count_tokens(m.get("content") or "") for m in messages)
-
-def _turn_start(messages: list, assistant_i: int) -> int:
-    j = assistant_i
-    while j - 1 >= 0 and messages[j - 1].get("role") == "tool":
-        j -= 1
-    return j
-
-def _find_cut(messages: list) -> int:
-    """Backwards walk; MUST land on a turn boundary (atomicity invariant)."""
-    cut = len(messages)
-    kept = 0
-    while cut > 1 and kept < KEEP_RECENT:
-        prev = messages[cut - 1]
-        if prev.get("role") == "assistant" and prev.get("tool_calls"):
-            cut = _turn_start(messages, cut - 1)
-            kept += 1
-        else:
-            cut -= 1
-            if prev.get("role") in ("user", "assistant"):
-                kept += 1
-    return cut
-
-def maybe_compress(messages: list) -> list:
+def maybe_compress(messages):
     if context_size(messages) <= CONTEXT_BUDGET:
-        return messages                       # no-op
-    cut = _find_cut(messages)
-    old, recent = messages[1:cut], messages[cut:]   # skip system (index 0)
+        return messages                                  # no-op under budget
+    cut = _find_cut(messages)                            # backwards walk, turn
+    old, recent = messages[1:cut], messages[cut:]        # boundaries ONLY
     if not old:
-        return messages                       # nothing compressible yet
-    return [messages[0], _summarize(old)] + recent
+        return messages                                  # nothing compressible yet
+    return [messages[0], _summarize(old)] + recent       # [sys, summary, recent]
 
-def _summarize(old: list) -> dict:
-    from agent.llm import chat
-    transcript = "\n".join(
-        f"[{m['role']}] {(m.get('content') or '')[:500]}"
-        for m in old if m["role"] != "system")
-    out = chat([
-        {"role": "system", "content":
-         "Summarize an agent's earlier work. Terse but complete. Include: "
-         "(1) goal, (2) actions taken and results, (3) files touched with "
-         "paths, (4) current state, (5) what remains. Max 250 words."},
-        {"role": "user", "content": transcript[:8000]},
-    ], tools=None)
-    text = out.get("content") or "(summary unavailable)"
-    return {"role": "user",
-            "content": f"[CONTEXT SUMMARY of earlier turns]\n{text}"}
+def _find_cut(messages):
+    """Walk BACKWARDS from the end counting KEEP_RECENT turns. When hitting an
+    assistant msg with tool_calls, jump to the START of its turn (_turn_start) —
+    never split an assistant message from its tool results (atomicity)."""
+    ...
+
+def _summarize(old):
+    """One cheap LLM call: goal / actions+results / files touched / state /
+    what remains. Returns a user-role message: '[CONTEXT SUMMARY of earlier
+    turns] ...' — a note handed to the agent, not a false memory."""
+    ...
 ```
 
-### `agent/sessions.py`
+(Token counting: `tiktoken` when installed, else `len(text)//4` heuristic — fine for thresholds.)
+
+**`agent/sessions.py`** — the schema IS the design:
 
 ```python
-# Append-only SQLite diary. Storage is truth; context is a view (load()).
-# Full protocol stored (tool_call_id, tool_calls JSON) so /resume is
-# API-valid. parent_id = compression lineage. Same table = Phase 7 FTS5.
-import json, sqlite3, uuid
-from datetime import datetime
-
 DB_PATH = "sessions.db"
-
-def _conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY, title TEXT, parent_id TEXT, created_at TEXT NOT NULL)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL, seq INTEGER NOT NULL,
-        role TEXT NOT NULL, content TEXT,
-        tool_call_id TEXT, tool_calls TEXT, created_at TEXT NOT NULL)""")
-    return conn
-
-def new_session(title=None, parent_id=None) -> str:
-    sid = uuid.uuid4().hex[:12]
-    with _conn() as conn:
-        conn.execute("INSERT INTO sessions (id,title,parent_id,created_at) "
-                     "VALUES (?,?,?,?)",
-                     (sid, title, parent_id,
-                      datetime.now().isoformat(timespec="seconds")))
-    return sid
-
-def set_title(session_id, title):
-    with _conn() as conn:
-        conn.execute("UPDATE sessions SET title=? WHERE id=?", (title, session_id))
+# sessions:  id, title, parent_id (lineage), created_at
+# messages:  session_id, seq, role, content, tool_call_id, tool_calls, created_at
+#            ^ append-only: INSERT only, never UPDATE/DELETE messages
 
 def append(session_id, role, content, tool_call_id=None, tool_calls=None):
-    with _conn() as conn:
-        seq = conn.execute("SELECT COALESCE(MAX(seq),-1)+1 FROM messages "
-                           "WHERE session_id=?", (session_id,)).fetchone()[0]
-        conn.execute("INSERT INTO messages (session_id,seq,role,content,"
-                     "tool_call_id,tool_calls,created_at) VALUES (?,?,?,?,?,?,?)",
-                     (session_id, seq, role, content, tool_call_id, tool_calls,
-                      datetime.now().isoformat(timespec="seconds")))
+    seq = SELECT COALESCE(MAX(seq),-1)+1 ...             # next diary line
+    INSERT INTO messages ...                             # atomic, crash-safe
 
-def load(session_id) -> list:
-    with _conn() as conn:
-        rows = conn.execute("SELECT role,content,tool_call_id,tool_calls "
-                            "FROM messages WHERE session_id=? ORDER BY seq",
-                            (session_id,)).fetchall()
-    out = []
-    for role, content, tcid, tcs in rows:
-        msg = {"role": role, "content": content or ""}
-        if role == "assistant" and tcs:
-            msg["tool_calls"] = json.loads(tcs)
-        if role == "tool" and tcid:
-            msg["tool_call_id"] = tcid
-        out.append(msg)
-    return out
-
-def list_sessions(limit=10):
-    with _conn() as conn:
-        return conn.execute(
-            "SELECT s.id,s.title,s.parent_id,COUNT(m.id),s.created_at FROM "
-            "sessions s LEFT JOIN messages m ON m.session_id=s.id GROUP BY "
-            "s.id ORDER BY s.created_at DESC LIMIT ?", (limit,)).fetchall()
+def load(session_id):
+    rows = SELECT role, content, tool_call_id, tool_calls ... ORDER BY seq
+    # rebuild EXACTLY the list run() expects: restore tool_calls JSON on
+    # assistant msgs, tool_call_id on tool msgs -> /resume is API-valid
 ```
 
-### `loop.py` — two hooks
+**`loop.py`** — the only two lines added (hooks stay dumb):
 
 ```python
-from agent.context import maybe_compress
-from agent import sessions
-
-def run(user_message, history=None, session_id=None):
-    ...
-    if session_id:
-        sessions.append(session_id, "user", user_message)
-    for turn in range(1, MAX_TURNS + 1):
-        messages = maybe_compress(messages)          # HOOK 1 (preflight)
-        assistant_msg = chat(messages, schemas())
-        messages.append(assistant_msg)
-        if session_id:
-            sessions.append(session_id, "assistant",
-                            assistant_msg.get("content") or "(tool calls)",
-                            tool_calls=(json.dumps(assistant_msg["tool_calls"])
-                                        if assistant_msg.get("tool_calls") else None))
-        ...
-        # after each dispatch result:
-        if session_id:                               # HOOK 2
-            sessions.append(session_id, "tool", result or "(no output)",
-                            tool_call_id=tc["id"])
+messages = maybe_compress(messages)          # HOOK 1: before every model call
+sessions.append(session_id, role, content)   # HOOK 2: for every message produced
+# (assistant rows also store tool_calls JSON; tool rows also store tool_call_id)
 ```
 
-### `main.py` — session commands
-
-`/new` → `sessions.new_session()`; `/sessions` → `list_sessions()`; `/resume <id>` → `load(id)` as history; `/title <name>` → `set_title`. First message auto-titles a fresh session.
+**`main.py`** — REPL commands mapping 1:1 to sessions.py: `/new`→`new_session()`, `/sessions`→`list_sessions()`, `/resume <id>`→`load(id)` passed as `history=`, `/title <name>`→`set_title()`. First message auto-titles.
 
 ---
 

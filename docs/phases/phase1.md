@@ -64,88 +64,44 @@ Two stop conditions: (a) the model answers with no tool calls (task complete), (
 
 ---
 
-## 4. Code
+## 4. Code — the key parts
 
-### `agent/llm.py`
+**`agent/llm.py`** — thin client; the only interesting part is normalizing the response:
 
 ```python
-# Thin client over a (OpenRouter-compatible) chat-completions endpoint.
-import os
-from dotenv import load_dotenv
-from openai import OpenAI
-
-load_dotenv()
-client = OpenAI(
-    base_url=os.getenv("BASE_URL", "https://api.openai.com/v1"),
-    api_key=os.getenv("API_KEY"),
-)
-
 def chat(messages, tools):
     resp = client.chat.completions.create(
-        model=os.getenv("MODEL", "openai/gpt-4o-mini"),
-        messages=messages,
-        tools=tools,
-    )
-    msg = resp.choices[0].message
+        model=os.getenv("MODEL", "openai/gpt-4o-mini"), messages=messages, tools=tools)
     out = {"role": "assistant", "content": msg.content or ""}
     if msg.tool_calls:
-        out["tool_calls"] = [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.function.name,
-                          "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ]
+        out["tool_calls"] = [{"id": tc.id, "type": "function",
+                              "function": {"name": tc.function.name,
+                                           "arguments": tc.function.arguments}}
+                             for tc in msg.tool_calls]
     return out
 ```
 
-### `agent/loop.py` (Phase 1 core — later phases add hooks)
+**`agent/loop.py`** — the skeleton; every rule from §1 lives here:
 
 ```python
-# Loop: messages -> LLM -> tool_calls? -> execute -> observe -> repeat.
-import json
-from agent.llm import chat
-from agent.prompt import SYSTEM_PROMPT
-from tools.registry import schemas, dispatch
-
-MAX_TURNS = 25
-MAX_TOOL_OUTPUT = 2000
-
-def run(user_message: str, history: list = None):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + (history or [])
-    messages.append({"role": "user", "content": user_message})
-
+def run(user_message, history=None):
+    messages = [system] + (history or []) + [{"role": "user", "content": user_message}]
     for turn in range(1, MAX_TURNS + 1):
-        print(f"\n--- turn {turn}/{MAX_TURNS} ---")
         assistant_msg = chat(messages, schemas())
-        messages.append(assistant_msg)          # RULE 1: assistant BEFORE tools
-
+        messages.append(assistant_msg)               # RULE 1: assistant BEFORE tools
         tool_calls = assistant_msg.get("tool_calls", [])
         if not tool_calls:
-            return assistant_msg["content"], messages[1:]
-
+            return assistant_msg["content"], messages[1:]   # STOP: plain answer
         for tc in tool_calls:
-            name = tc["function"]["name"]
-            try:
-                args = json.loads(tc["function"]["arguments"] or "{}")
-                if not isinstance(args, dict):
-                    raise ValueError("arguments must be a JSON object")
-            except (json.JSONDecodeError, ValueError) as e:
-                result = f"ERROR: could not parse tool arguments: {e}"
-            else:
-                print(f"⚡ ACT: {name}({args})")
-                result = dispatch(name, args)
-            if result and len(result) > MAX_TOOL_OUTPUT:
-                result = result[:MAX_TOOL_OUTPUT] + "\n...[truncated]"
-            print(f"👁 OBSERVE: {(result or '')[:150]}")
+            args = json.loads(...)                   # RULE 2: bad JSON -> ERROR observation
+            result = dispatch(name, args)            # the ONLY door to the machine
+            result = result[:MAX_TOOL_OUTPUT] + "...[truncated]"  # RULE 3
             messages.append({"role": "tool", "tool_call_id": tc["id"],
                              "content": result or "(no output)"})
-
-    return "Iteration budget exhausted — task incomplete.", messages[1:]
+    return "Iteration budget exhausted — task incomplete.", messages[1:]  # RULE 5
 ```
 
-### `tools/files.py` + `tools/registry.py`
-
-Four tools: `read_file`, `write_file`, `run_command` (30s timeout, captures stdout/stderr/exit code), `finish`. The registry maps name → handler and exposes JSON schemas; `dispatch(name, args)` is the single entry the loop calls. (Phase 2 turns `dispatch` into the security chokepoint.)
+**Tools:** `read_file`, `write_file`, `run_command` (30s timeout), `finish` (intercepted before the registry — requires `summary` + `evidence`). Registry = dict name→handler + JSON schemas; `dispatch()` is the single entry the loop calls. (Phase 2 turns it into the security chokepoint.)
 
 ---
 

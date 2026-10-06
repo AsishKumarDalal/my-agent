@@ -86,106 +86,69 @@ AgentDojo's core finding: any agent can be made perfectly secure by making it us
 
 ---
 
-## 4. Code
+## 4. Code — the key parts
 
-### `tools/sandbox.py`
+**`tools/sandbox.py`** — pure function, string in / verdict out. The two moves that matter:
 
 ```python
-# Every path-touching tool call passes through validate_path() BEFORE the
-# handler runs. Model-proposed paths are untrusted input: resolve them
-# absolutely, then check they stay inside the workspace. Fail-safe = deny.
-import os
-from pathlib import Path
-
 WORKSPACE = Path(os.getenv("AGENT_WORKSPACE", ".")).resolve()
 FORBIDDEN_NAMES = {".env", ".git", ".venv", "node_modules", ".ssh", "id_rsa"}
 
-def validate_path(path_str: str) -> str:
-    """'OK' if safe, else an ERROR string (a denial observation)."""
-    if not path_str:
-        return "ERROR: empty path"
+def validate_path(path_str) -> str:
     p = Path(path_str)
     if not p.is_absolute():
         p = WORKSPACE / p
-    try:
-        p = p.resolve()      # collapses ../ and symlinks BEFORE judging
-    except OSError as e:
-        return f"ERROR: cannot resolve path: {e}"
-    if not str(p).startswith(str(WORKSPACE)):
-        return ("ERROR: path resolves outside the workspace "
-                f"({p}). The agent may only access files inside {WORKSPACE}. "
-                "Do not retry silently — ask the user.")
-    for part in p.parts:     # catches notes/../.env too
+    p = p.resolve()          # MOVE 1: collapse ../ and symlinks BEFORE judging
+    if not str(p).startswith(str(WORKSPACE)):                    # MOVE 2: allowlist
+        return "ERROR: path resolves outside the workspace... Do not retry — ask the user."
+    for part in p.parts:     # catches notes/../.env too (every component)
         if part in FORBIDDEN_NAMES:
-            return (f"ERROR: access to '{part}' is forbidden by policy. "
-                    "Do not retry — ask the user.")
+            return f"ERROR: access to '{part}' is forbidden by policy..."
     return "OK"
 ```
 
-### `tools/approval.py`
+**`tools/approval.py`** — tripwire + the seam. Only two things worth showing:
 
 ```python
-# Danger detection = cheap blocklist tripwire backed by the approval gate.
-# APPROVAL_CALLBACK is THE SEAM: swap CLI for Telegram later, untouched tools.
-import os
+DANGEROUS_PATTERNS = ["rm -rf", "del /s", "format ", "curl ", "| bash", "sudo ", ...]
 
-DANGEROUS_PATTERNS = [
-    "rm -rf", "rm -r ", "rmdir /s", "del /s", "del /f", "rd /s",
-    "format ", "mkfs", "shutdown", "reboot",
-    "> /dev/sda", "dd if=",
-    "curl ", "wget ", "Invoke-WebRequest", "iwr ",
-    "| sh", "| bash", "| powershell", "| iex",
-    "chmod 777", "sudo ",
-]
+APPROVAL_CALLBACK = None          # THE SEAM — swapped by main.py / Telegram later
 
-def is_dangerous(command: str) -> bool:
-    cmd = command.lower()
-    return any(pat.lower() in cmd for pat in DANGEROUS_PATTERNS)
-
-APPROVAL_CALLBACK = None   # set from main.py; None = use default
-
-def _default_callback(command: str, tool_name: str) -> bool:
-    if not os.isatty(0):     # fail-safe: no human available -> deny
-        print(f"[approval] no TTY; DENIED by default: {command}")
-        return False
-    print(f"\n⚠ APPROVAL NEEDED ({tool_name}):\n   {command}")
-    return input("   Allow? [y/N] ").strip().lower() == "y"
-
-def request_approval(command: str, tool_name: str) -> bool:
+def request_approval(command, tool_name) -> bool:
     cb = APPROVAL_CALLBACK or _default_callback
     try:
         return bool(cb(command, tool_name))
-    except Exception as e:
-        print(f"[approval] callback failed ({e}); denying by default")
+    except Exception:             # fail-closed: broken channel = deny
         return False
 ```
 
-### `tools/registry.py` — the chokepoint
+(`_default_callback` denies when `not os.isatty(0)` — no human available = no dangerous action.)
+
+**`tools/registry.py`** — the chokepoint. `dispatch()` in full, since this IS the phase:
 
 ```python
-def dispatch(name: str, args: dict) -> str:
+def dispatch(name, args) -> str:
     # 1) cheapest check first: existence (fail-safe default)
     if name not in REGISTRY:
-        return (f"ERROR: unknown tool '{name}'. Available: {sorted(REGISTRY)} "
-                "— do not invent tool names.")
+        return f"ERROR: unknown tool '{name}'. Available: {sorted(REGISTRY)}..."
     # 2) dangerous shell -> human approval
     if name == "run_command":
         cmd = str(args.get("command", ""))
         if is_dangerous(cmd) and not request_approval(cmd, name):
-            return ("DENIED: command requires human approval and was refused. "
-                    "Do not retry silently — ask the user or propose a safer "
-                    "alternative.")
+            return "DENIED: command requires human approval and was refused. Do not retry..."
     # 3) path args -> sandbox validation BEFORE the handler sees them
     for key in PATH_KEYS.get(name, ()):
         verdict = validate_path(str(args.get(key, "")))
         if verdict != "OK":
-            return verdict
+            return verdict                    # teaching denial, straight to the model
     # 4) all checks passed — execute
     try:
         return str(REGISTRY[name](args))
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 ```
+
+**`main.py`:** `approval.APPROVAL_CALLBACK = _default_callback` and `os.environ.setdefault("AGENT_WORKSPACE", os.getcwd())` — that's all.
 
 ---
 
