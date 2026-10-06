@@ -45,8 +45,13 @@ def _make_renderer():
 
 
 def run(user_message: str, history: list = None, session_id: str = None,
-        max_turns: int = MAX_TURNS, allow_delegate: bool = True):
-    """Returns (final_answer, history_without_system_prompt)."""
+        max_turns: int = MAX_TURNS, allow_delegate: bool = True,
+        on_text=None, on_event=None, on_reasoning=None):
+    """Returns (final_answer, history_without_system_prompt).
+    UI callbacks (web frontend): on_text -> text deltas; on_reasoning ->
+    reasoning deltas; on_event -> {"kind": "turn"|"act"|"observe", "text": str}
+    with FULL tool args and FULL post-truncation tool output (ACT/OBSERVE).
+    When omitted, a CLI adapter reproduces the classic console output."""
     # Phase 7: semantic memory injected into the system prompt tier — the
     # "always true" knowledge. Safe to do on EVERY run(): messages are rebuilt
     # fresh each call and history excludes the system prompt, so it never
@@ -60,8 +65,17 @@ def run(user_message: str, history: list = None, session_id: str = None,
     if session_id:
         sessions.append(session_id, "user", user_message)
 
+    if on_event is None:   # CLI adapter: dicts -> the classic console lines
+        def on_event(ev):
+            if ev["kind"] == "turn":
+                print(f"\n--- turn {ev['text']} ---")
+            elif ev["kind"] == "act":
+                print(f"⚡ ACT: {ev['text'][:100]}")
+            elif ev["kind"] == "observe":
+                print(f"👁 OBSERVE: {ev['text'][:150]}")
+
     for turn in range(1, max_turns + 1):
-        print(f"\n--- turn {turn}/{max_turns} ---")
+        on_event({"kind": "turn", "text": f"{turn}/{max_turns}"})
 
         # HOOK 1: preflight compression (Hermes does the same before every
         # API call). Under budget it returns messages unchanged — a no-op.
@@ -69,20 +83,27 @@ def run(user_message: str, history: list = None, session_id: str = None,
 
         # Phase 8: stream tokens live. AGENT_STREAM=0 restores the old
         # silent-until-done behavior. Internal calls (summaries, reflection)
-        # pass no callback, so they never print.
-        render, streamed = _make_renderer()
-        on_text = render if os.getenv("AGENT_STREAM", "1") == "1" else None
+        # pass no callback, so they never print. An injected on_text (web UI)
+        # always streams, regardless of the env flag.
+        if on_text is not None:
+            render, streamed = on_text, {"started": False}
+        else:
+            render, streamed = _make_renderer()
+        on_text_cb = render if (on_text is not None
+                                or os.getenv("AGENT_STREAM", "1") == "1") else None
 
         # Phase 6: the harness layer handles API failures below the model's
         # awareness (backoff+jitter, emergency compression, circuit breaker).
         # Nothing was appended yet, so retries can never double-persist.
         try:
-            assistant_msg = chat_with_retries(messages, schemas(), on_text=on_text)
+            assistant_msg = chat_with_retries(messages, schemas(),
+                                              on_text=on_text_cb,
+                                              on_reasoning=on_reasoning)
         except RunAborted as e:
             # honest stop — the session stays valid for /resume
             return f"Run aborted: {e}", messages[1:]
         finally:
-            if streamed["started"]:
+            if streamed["started"] and on_text is None:
                 print()   # close the streamed line before ACT/OBSERVE output
 
         messages.append(assistant_msg)  # RULE 1: assistant msg BEFORE tool results
@@ -110,7 +131,9 @@ def run(user_message: str, history: list = None, session_id: str = None,
                     raise ValueError("arguments must be a JSON object")
             except (json.JSONDecodeError, ValueError) as e:
                 return f"ERROR: could not parse tool arguments: {e}"
-            print(f"⚡ ACT: {name}({str(args)[:100]})")
+            # full raw args go to the UI; the CLI adapter truncates for display
+            on_event({"kind": "act",
+                      "text": f"{name}({tc['function']['arguments'] or ''})"})
             return dispatch(name, args)
 
         # Phase 5: the model asserting several calls in ONE message declares
@@ -127,7 +150,8 @@ def run(user_message: str, history: list = None, session_id: str = None,
             # RULE 3: truncate — one big file must not eat your context
             if result and len(result) > MAX_TOOL_OUTPUT:
                 result = result[:MAX_TOOL_OUTPUT] + "\n...[truncated]"
-            print(f"👁 OBSERVE: {(result or '')[:150]}")
+            # the UI gets the FULL post-truncation output; CLI keeps it short
+            on_event({"kind": "observe", "text": result or "(no output)"})
 
             messages.append({
                 "role": "tool",

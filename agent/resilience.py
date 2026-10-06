@@ -75,7 +75,8 @@ def emergency_compress(messages: list) -> list:
     return [slim[0], ctx._summarize(old)] + recent
 
 
-def chat_with_retries(messages: list, tools: list, on_text=None) -> dict:
+def chat_with_retries(messages: list, tools: list, on_text=None,
+                      on_reasoning=None) -> dict:
     """Drop-in replacement for chat() — the loop's only visible change.
     Raises RunAborted when the failure is fatal or the breaker trips.
 
@@ -98,12 +99,18 @@ def chat_with_retries(messages: list, tools: list, on_text=None) -> dict:
             emitted["any"] = True
             on_text(token)
 
+    def _spy_reasoning(token: str):
+        # reasoning on screen also cannot be un-emitted across a retry
+        if on_reasoning:
+            emitted["any"] = True
+            on_reasoning(token)
+
     compressed = False                     # emergency compress: at most once
     attempt = 0
     last_err = None                        # `except ... as e` deletes e on
     while attempt < MAX_ATTEMPTS:          # block exit — keep our own ref
         try:
-            msg = chat(messages, tools, _spy)
+            msg = chat(messages, tools, _spy, _spy_reasoning)
             _consecutive_failures = 0      # success resets the breaker
             return msg
         except Exception as e:
@@ -124,7 +131,8 @@ def chat_with_retries(messages: list, tools: list, on_text=None) -> dict:
                     break
                 if emitted["any"]:
                     print("\n[stream interrupted — the partial output above "
-                          "was discarded; retrying from scratch]")
+                          "(text and thinking) was discarded; retrying from "
+                          "scratch]")
                     emitted["any"] = False   # next attempt renders fresh
                 _sleep_backoff(attempt, e)
                 continue

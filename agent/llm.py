@@ -16,19 +16,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(
-    base_url=os.getenv("BASE_URL", "https://api.openai.com/v1"),
-    api_key=os.getenv("API_KEY"),
-)
+# Lazy client: a missing/invalid API_KEY must not crash at import time (the
+# web server imports this module on boot). It raises on first actual call,
+# where resilience/UI error handling can surface it cleanly.
+_client = None
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            base_url=os.getenv("BASE_URL", "https://api.openai.com/v1"),
+            api_key=os.getenv("API_KEY"),
+        )
+    return _client
 
 # Set False the first time a provider rejects streaming, so we stop trying
 # for the rest of the process (a capability fact, not a per-call error).
 _stream_supported = True
 
 
-def _assemble(messages: list, tools: list, on_text) -> dict:
-    """Streaming path: render text live, accumulate tool calls by index."""
-    stream = client.chat.completions.create(
+def _assemble(messages: list, tools: list, on_text, on_reasoning) -> dict:
+    """Streaming path: render text live, accumulate tool calls by index.
+    Reasoning deltas (provider-dependent field) go to on_reasoning and are
+    deliberately NOT stored — they are scratch work, not protocol."""
+    stream = _get_client().chat.completions.create(
         model=os.getenv("MODEL", "openai/gpt-4o-mini"),
         messages=messages,
         tools=tools,
@@ -44,6 +56,13 @@ def _assemble(messages: list, tools: list, on_text) -> dict:
         delta = chunk.choices[0].delta
         if delta is None:            # some providers send a null final delta
             continue
+
+        # reasoning models expose their thinking either as `reasoning_content`
+        # (DeepSeek-style) or `reasoning` (OpenRouter-style)
+        reasoning = getattr(delta, "reasoning_content", None) \
+            or getattr(delta, "reasoning", None)
+        if reasoning and isinstance(reasoning, str) and on_reasoning:
+            on_reasoning(reasoning)
 
         if delta.content:
             text_parts.append(delta.content)
@@ -83,16 +102,21 @@ def _assemble(messages: list, tools: list, on_text) -> dict:
     return msg
 
 
-def _blocking(messages: list, tools: list, on_text) -> dict:
+def _blocking(messages: list, tools: list, on_text, on_reasoning) -> dict:
     """Original non-streaming path — the fallback when streaming is off or the
     provider rejects it. If the caller asked for rendering, hand over the whole
     text at once rather than not showing it at all."""
-    resp = client.chat.completions.create(
+    resp = _get_client().chat.completions.create(
         model=os.getenv("MODEL", "openai/gpt-4o-mini"),
         messages=messages,
         tools=tools,
     )
     msg = resp.choices[0].message
+
+    reasoning = getattr(msg, "reasoning_content", None) \
+        or getattr(msg, "reasoning", None)
+    if reasoning and isinstance(reasoning, str) and on_reasoning:
+        on_reasoning(reasoning)
 
     assistant_msg = {"role": "assistant", "content": msg.content or ""}
     if msg.tool_calls:
@@ -120,9 +144,9 @@ def _looks_like_no_stream(e: Exception) -> bool:
     return status == 400 and "stream" in str(e).lower()
 
 
-def chat(messages: list, tools: list, on_text=None) -> dict:
-    """One model call. `on_text` is an optional callback receiving text deltas
-    as they are generated."""
+def chat(messages: list, tools: list, on_text=None, on_reasoning=None) -> dict:
+    """One model call. `on_text` receives text deltas; `on_reasoning` receives
+    the model's reasoning deltas (when the provider emits them)."""
     global _stream_supported
 
     emitted = {"any": False}
@@ -136,7 +160,7 @@ def chat(messages: list, tools: list, on_text=None) -> dict:
 
     if _stream_supported and os.getenv("AGENT_STREAM", "1") == "1":
         try:
-            return _assemble(messages, tools, _spy)
+            return _assemble(messages, tools, _spy, on_reasoning)
         except Exception as e:
             if not emitted["any"] and _looks_like_no_stream(e):
                 _stream_supported = False
@@ -145,4 +169,4 @@ def chat(messages: list, tools: list, on_text=None) -> dict:
             else:
                 raise
 
-    return _blocking(messages, tools, on_text)
+    return _blocking(messages, tools, on_text, on_reasoning)
